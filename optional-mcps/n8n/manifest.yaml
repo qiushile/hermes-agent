@@ -51,6 +51,22 @@ auth:
       required: true
       secret: true
 
+# Tool selection at install time:
+# n8n's bridge exposes 11 tools. Mutating ones (activate/deactivate, docker
+# container_logs) are pruned from the default so a user who installs casually
+# gets a read-mostly safe surface. Users see the full list in the install-time
+# checklist and can opt into the mutating tools per their threat model.
+tools:
+  default_enabled:
+    - health
+    - list_workflows
+    - get_workflow
+    - find_workflows
+    - list_executions
+    - get_execution
+    - recent_failures
+    - export_workflow
+
 post_install: |
   The n8n bridge expects to talk to a running n8n instance over the URL you
   provided. Generate an API key in n8n under Settings → API.

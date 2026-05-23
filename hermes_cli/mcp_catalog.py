@@ -93,12 +93,27 @@ class InstallSpec:
 
 
 @dataclass
+class ToolsSpec:
+    """Manifest-side tool-selection hints.
+
+    Drives the pre-checked state of the install-time tool checklist, and acts
+    as the fallback selection when probe fails. See install_entry() flow.
+    """
+
+    # If declared, these tool names are pre-checked in the checklist (or
+    # applied directly when probe fails). If None, all probed tools are
+    # pre-checked (or no filter is written when probe fails).
+    default_enabled: Optional[List[str]] = None
+
+
+@dataclass
 class CatalogEntry:
     name: str
     description: str
     source: str
     transport: TransportSpec
     auth: AuthSpec
+    tools: ToolsSpec = field(default_factory=ToolsSpec)
     install: Optional[InstallSpec] = None
     post_install: str = ""
     manifest_path: Path = field(default_factory=Path)
@@ -200,6 +215,19 @@ def _parse_manifest(path: Path) -> CatalogEntry:
         env_var=auth_raw.get("env_var"),
     )
 
+    tools_raw = data.get("tools") or {}
+    if not isinstance(tools_raw, dict):
+        raise CatalogError(f"{path}: 'tools' must be a mapping")
+    default_enabled = tools_raw.get("default_enabled")
+    if default_enabled is not None:
+        if not isinstance(default_enabled, list) or not all(
+            isinstance(t, str) for t in default_enabled
+        ):
+            raise CatalogError(
+                f"{path}: tools.default_enabled must be a list of strings"
+            )
+    tools_spec = ToolsSpec(default_enabled=default_enabled)
+
     install: Optional[InstallSpec] = None
     install_raw = data.get("install")
     if install_raw is not None:
@@ -228,6 +256,7 @@ def _parse_manifest(path: Path) -> CatalogEntry:
         source=source,
         transport=transport,
         auth=auth,
+        tools=tools_spec,
         install=install,
         post_install=str(data.get("post_install") or ""),
         manifest_path=path,
@@ -404,6 +433,192 @@ def _build_server_config(
     return cfg
 
 
+def _read_prior_tool_selection(name: str) -> Optional[List[str]]:
+    """Return the user's prior `tools.include` for *name*, if any.
+
+    Used during reinstalls so the install-time checklist starts pre-checked
+    with whatever the user already had. Tools no longer on the server are
+    silently dropped at checklist-display time.
+    """
+    servers = installed_servers()
+    cfg = servers.get(name) or {}
+    tools_cfg = cfg.get("tools") or {}
+    if not isinstance(tools_cfg, dict):
+        return None
+    include = tools_cfg.get("include")
+    if isinstance(include, list) and all(isinstance(t, str) for t in include):
+        return list(include)
+    return None
+
+
+def _probe_tools(name: str) -> Optional[List[tuple]]:
+    """Connect to a freshly-configured MCP and list its tools.
+
+    Returns a list of ``(tool_name, description)`` tuples on success, or
+    ``None`` on any failure (server unreachable, OAuth not yet completed,
+    backing service offline, etc.). Failures are intentionally swallowed
+    here — the fallback path in :func:`_apply_tool_selection` handles them.
+    """
+    servers = installed_servers()
+    server_cfg = servers.get(name)
+    if not server_cfg:
+        return None
+    try:
+        # Import lazily so the catalog module stays cheap to load.
+        from hermes_cli.mcp_config import _probe_single_server
+
+        tools = _probe_single_server(name, server_cfg)
+        return list(tools) if tools is not None else []
+    except Exception as exc:
+        # Display the cause but never raise from the install path.
+        print(color(f"  Probe failed: {exc}", Colors.YELLOW))
+        return None
+
+
+def _write_tools_include(name: str, include: Optional[List[str]]) -> None:
+    """Persist or clear ``mcp_servers.<name>.tools.include``."""
+    cfg = load_config()
+    servers = cfg.setdefault("mcp_servers", {})
+    server_entry = servers.get(name) or {}
+    if include is None:
+        # No filter — drop any existing tools block.
+        server_entry.pop("tools", None)
+    else:
+        tools_block = server_entry.get("tools") or {}
+        if not isinstance(tools_block, dict):
+            tools_block = {}
+        tools_block["include"] = list(include)
+        tools_block.pop("exclude", None)
+        server_entry["tools"] = tools_block
+    servers[name] = server_entry
+    cfg["mcp_servers"] = servers
+    save_config(cfg)
+
+
+def _apply_tool_selection(
+    entry: CatalogEntry, *, prior_selection: Optional[List[str]]
+) -> None:
+    """Probe the server and let the user pick which tools to enable.
+
+    Probe-success path:
+      - Curses checklist of all probed tools.
+      - Pre-check uses (in priority order):
+          1. *prior_selection* (reinstall: preserve what the user had)
+          2. manifest's ``tools.default_enabled``
+          3. all tools (default)
+      - All-on selection clears any filter (no ``tools.include`` written).
+      - Sub-selection writes ``tools.include``.
+
+    Probe-fail path:
+      - If manifest declares ``tools.default_enabled`` → apply directly.
+      - Otherwise → leave config with no filter (all on when reachable).
+      - Either way, point the user at ``hermes mcp configure <name>``.
+    """
+    print()
+    print(color(f"  Probing '{entry.name}' for available tools...", Colors.CYAN))
+    probed = _probe_tools(entry.name)
+
+    # Probe failure path
+    if probed is None:
+        manifest_default = entry.tools.default_enabled
+        if manifest_default:
+            _write_tools_include(entry.name, manifest_default)
+            print(color(
+                f"  Couldn\'t probe server. Applied manifest default "
+                f"({len(manifest_default)} tools). "
+                f"Run `hermes mcp configure {entry.name}` after the server "
+                "is reachable to refine.",
+                Colors.YELLOW,
+            ))
+        else:
+            _write_tools_include(entry.name, None)
+            print(color(
+                f"  Couldn\'t probe server; installed with no tool filter "
+                "(all tools enabled when reachable). "
+                f"Run `hermes mcp configure {entry.name}` after first "
+                "connect to prune.",
+                Colors.YELLOW,
+            ))
+        return
+
+    if not probed:
+        # Probe succeeded but server reported zero tools. Nothing to filter.
+        _write_tools_include(entry.name, None)
+        print(color("  Server reported no tools.", Colors.YELLOW))
+        return
+
+    tool_names = [t[0] for t in probed]
+
+    # Build the pre-checked set in priority order
+    if prior_selection:
+        pre_set = {n for n in prior_selection if n in tool_names}
+    elif entry.tools.default_enabled:
+        pre_set = {n for n in entry.tools.default_enabled if n in tool_names}
+    else:
+        pre_set = set(tool_names)
+
+    pre_indices = {i for i, n in enumerate(tool_names) if n in pre_set}
+
+    # Non-TTY: skip the checklist. Priority matches the interactive
+    # pre-check priority: prior user selection > manifest default > all-on.
+    import sys as _sys
+    if not _sys.stdin.isatty():
+        if prior_selection is not None:
+            include = [n for n in prior_selection if n in tool_names]
+            _write_tools_include(entry.name, include)
+        elif entry.tools.default_enabled:
+            include = [n for n in entry.tools.default_enabled if n in tool_names]
+            _write_tools_include(entry.name, include)
+        else:
+            _write_tools_include(entry.name, None)
+        return
+
+    print(color(
+        f"  Found {len(probed)} tool(s). "
+        f"Pre-checked: {len(pre_indices)}.",
+        Colors.GREEN,
+    ))
+
+    from hermes_cli.curses_ui import curses_checklist
+
+    labels = [
+        f"{n}  —  {(d[:60] + '...') if len(d) > 60 else d}"
+        for n, d in probed
+    ]
+    chosen_indices = curses_checklist(
+        f"Select tools for '{entry.name}' (SPACE toggle, ENTER confirm)",
+        labels,
+        pre_indices,
+    )
+
+    if not chosen_indices:
+        # User unchecked everything; treat as "no tools" — write empty include
+        # so the server is installed but contributes nothing until reconfigured.
+        _write_tools_include(entry.name, [])
+        print(color(
+            f"  No tools selected. Run `hermes mcp configure {entry.name}` "
+            "to change.",
+            Colors.YELLOW,
+        ))
+        return
+
+    if len(chosen_indices) == len(probed):
+        # Everything selected — clear filter for the cleanest config shape
+        _write_tools_include(entry.name, None)
+        print(color(
+            f"  ✓ All {len(probed)} tools enabled.",
+            Colors.GREEN,
+        ))
+        return
+
+    chosen_names = [tool_names[i] for i in sorted(chosen_indices)]
+    _write_tools_include(entry.name, chosen_names)
+    print(color(
+        f"  ✓ {len(chosen_names)}/{len(probed)} tools enabled.",
+        Colors.GREEN,
+    ))
+
+
 def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
     """Install a catalog entry end-to-end.
 
@@ -411,11 +626,15 @@ def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
         1. If ``install.type == git``, clone + run bootstrap commands.
         2. If ``auth.type == api_key``, prompt for env vars, save to .env.
         3. If ``auth.type == oauth`` (remote MCP / case 1), write the
-           ``auth: oauth`` marker and let the MCP client handle browser flow
-           on first connection.
+           ``auth: oauth`` marker (MCP client handles browser on first connect
+           in the non-pre-authenticated case).
         4. Translate the manifest into an ``mcp_servers.<name>`` block and
            save into config.yaml.
-        5. Print post_install notes.
+        5. Probe the server, present a curses checklist for tool selection,
+           write ``tools.include`` (or no filter, depending on choice).
+           If probe fails, fall back to the manifest's
+           ``tools.default_enabled`` or all-on.
+        6. Print post_install notes.
     """
     print()
     print(color(f"  Installing MCP '{entry.name}'", Colors.CYAN + Colors.BOLD))
@@ -454,13 +673,22 @@ def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
             ))
     # auth.type == "none": nothing to do.
 
-    # Build and write the mcp_servers entry
+    # ── Preserve any prior user tool selection across reinstalls ────────
+    # Reading BEFORE we overwrite the entry below so a reinstall pre-checks
+    # whatever the user picked last time.
+    prior_selection = _read_prior_tool_selection(entry.name)
+
+    # Build and write the mcp_servers entry (without tools filter yet;
+    # _apply_tool_selection() finalizes it below).
     server_cfg = _build_server_config(entry, install_dir)
     server_cfg["enabled"] = enable
 
     cfg = load_config()
     cfg.setdefault("mcp_servers", {})[entry.name] = server_cfg
     save_config(cfg)
+
+    # ── Probe + tool selection ──────────────────────────────────────────
+    _apply_tool_selection(entry, prior_selection=prior_selection)
 
     print()
     print(color(

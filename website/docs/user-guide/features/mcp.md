@@ -87,6 +87,50 @@ Catalog entries can require:
 - **OAuth** (third-party provider like Google/GitHub) — Hermes points you at
   `hermes auth <provider>` if you haven't authenticated already.
 
+### Tool selection at install time
+
+After credentials are configured, Hermes probes the MCP server to list every
+tool it exposes and presents a checklist:
+
+```
+Select tools for 'linear' (SPACE toggle, ENTER confirm)
+  [x] find_issues       Find issues matching a query
+  [x] get_issue         Get a single issue
+  [x] create_issue      Create a new issue
+  [ ] delete_workspace  Delete a Linear workspace
+  ...
+```
+
+The pre-checked rows come from:
+
+1. **Your prior selection** if you've installed this entry before (reinstalls
+   preserve what you had — the manifest's defaults don't override it)
+2. **The manifest's `tools.default_enabled`** if the entry declares one (some
+   catalog entries pre-prune mutating or rarely-useful tools)
+3. **Everything** if neither applies
+
+Submit the checklist with ENTER. Only the checked tools end up in
+`mcp_servers.<name>.tools.include`. If you select everything, no filter is
+written (cleanest config shape, identical behavior).
+
+**If the probe fails** (server unreachable, OAuth not yet completed,
+backing service not running), the install still succeeds: the manifest's
+`tools.default_enabled` is applied directly (if declared), or no filter is
+written (if not). Re-run `hermes mcp configure <name>` once the server is
+reachable to refine.
+
+### Updating tool selection later
+
+```bash
+hermes mcp configure linear
+```
+
+Reopens the same checklist with your current selection pre-checked. Use this
+when you want more tools enabled, or when the server has added new tools that
+you want to opt into.
+
+### Updating the catalog manifest
+
 MCPs are never auto-updated. Re-run `hermes mcp install <name>` to refresh
 after a Hermes update if a manifest version changed.
 

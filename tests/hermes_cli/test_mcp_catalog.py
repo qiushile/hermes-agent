@@ -20,6 +20,22 @@ import yaml
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _default_mock_probe(monkeypatch):
+    """By default tests run the probe-fails path so install_entry() doesn\'t
+    try to talk to a real MCP server.
+
+    Individual tests that exercise probe-success behaviour patch
+    ``hermes_cli.mcp_catalog._probe_tools`` themselves.
+    """
+    # Patch the catalog\'s probe wrapper, not the underlying
+    # mcp_config._probe_single_server (so tests stay decoupled from that
+    # module\'s plumbing).
+    import hermes_cli.mcp_catalog as mc
+
+    monkeypatch.setattr(mc, "_probe_tools", lambda name: None)
+
+
 @pytest.fixture
 def catalog_dir(tmp_path, monkeypatch):
     """Provide an isolated optional-mcps/ directory."""
@@ -366,6 +382,138 @@ class TestPicker:
 # ---------------------------------------------------------------------------
 # Shipped catalog (sanity: every manifest in the repo's optional-mcps/ parses)
 # ---------------------------------------------------------------------------
+
+
+class TestToolSelection:
+    def _make_probed(self, *names):
+        """Return a list of (tool_name, description) tuples for mocking."""
+        return [(n, f"description of {n}") for n in names]
+
+    def test_probe_fail_no_default_writes_no_filter(self, catalog_dir):
+        body = _basic_manifest()
+        _write_manifest(catalog_dir, "demo", body)
+        from hermes_cli.mcp_catalog import install_entry
+        from hermes_cli.config import load_config
+
+        install_entry(_entry("demo"), enable=True)
+        server = load_config()["mcp_servers"]["demo"]
+        # No tools.include => all tools active when reachable
+        assert "tools" not in server, server
+
+    def test_probe_fail_with_default_applies_directly(self, catalog_dir):
+        body = _basic_manifest(
+            tools={"default_enabled": ["a", "b", "c"]},
+        )
+        _write_manifest(catalog_dir, "demo", body)
+        from hermes_cli.mcp_catalog import install_entry
+        from hermes_cli.config import load_config
+
+        install_entry(_entry("demo"), enable=True)
+        server = load_config()["mcp_servers"]["demo"]
+        assert server["tools"]["include"] == ["a", "b", "c"]
+
+    def test_probe_success_non_tty_with_default_filters_to_default(
+        self, catalog_dir, monkeypatch
+    ):
+        body = _basic_manifest(
+            tools={"default_enabled": ["alpha", "gamma"]},
+        )
+        _write_manifest(catalog_dir, "demo", body)
+        import hermes_cli.mcp_catalog as mc
+
+        probed = self._make_probed("alpha", "beta", "gamma", "delta")
+        monkeypatch.setattr(mc, "_probe_tools", lambda name: probed)
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: False)
+
+        from hermes_cli.mcp_catalog import install_entry
+        from hermes_cli.config import load_config
+
+        install_entry(_entry("demo"), enable=True)
+        server = load_config()["mcp_servers"]["demo"]
+        # Only the manifest defaults that actually exist on the server
+        assert server["tools"]["include"] == ["alpha", "gamma"]
+
+    def test_probe_success_non_tty_no_default_clears_filter(
+        self, catalog_dir, monkeypatch
+    ):
+        _write_manifest(catalog_dir, "demo", _basic_manifest())
+        import hermes_cli.mcp_catalog as mc
+
+        probed = self._make_probed("x", "y")
+        monkeypatch.setattr(mc, "_probe_tools", lambda name: probed)
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: False)
+
+        from hermes_cli.mcp_catalog import install_entry
+        from hermes_cli.config import load_config
+
+        install_entry(_entry("demo"), enable=True)
+        server = load_config()["mcp_servers"]["demo"]
+        assert "tools" not in server
+
+    def test_default_enabled_filters_out_unknown_tool_names(
+        self, catalog_dir, monkeypatch
+    ):
+        """If manifest names a tool the server doesn\'t actually expose, it
+        silently drops out — never written into tools.include."""
+        body = _basic_manifest(
+            tools={"default_enabled": ["real", "ghost"]},
+        )
+        _write_manifest(catalog_dir, "demo", body)
+        import hermes_cli.mcp_catalog as mc
+
+        probed = self._make_probed("real", "other")
+        monkeypatch.setattr(mc, "_probe_tools", lambda name: probed)
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: False)
+
+        from hermes_cli.mcp_catalog import install_entry
+        from hermes_cli.config import load_config
+
+        install_entry(_entry("demo"), enable=True)
+        server = load_config()["mcp_servers"]["demo"]
+        assert server["tools"]["include"] == ["real"]
+
+    def test_reinstall_preserves_prior_user_selection(
+        self, catalog_dir, monkeypatch
+    ):
+        """Second install of the same entry uses the user\'s prior
+        tools.include as the pre-check, NOT the manifest default."""
+        body = _basic_manifest(
+            tools={"default_enabled": ["alpha"]},
+        )
+        _write_manifest(catalog_dir, "demo", body)
+
+        import hermes_cli.mcp_catalog as mc
+        probed = self._make_probed("alpha", "beta", "gamma")
+        monkeypatch.setattr(mc, "_probe_tools", lambda name: probed)
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: False)
+
+        from hermes_cli.mcp_catalog import install_entry
+        from hermes_cli.config import load_config, save_config
+
+        # First install
+        install_entry(_entry("demo"), enable=True)
+        # Simulate user opening configure and choosing beta+gamma
+        cfg = load_config()
+        cfg["mcp_servers"]["demo"]["tools"]["include"] = ["beta", "gamma"]
+        save_config(cfg)
+
+        # Reinstall (non-TTY honors prior_selection over manifest default)
+        install_entry(_entry("demo"), enable=True)
+        server = load_config()["mcp_servers"]["demo"]
+        assert server["tools"]["include"] == ["beta", "gamma"], server
+
+    def test_manifest_invalid_default_enabled_rejected(self, catalog_dir):
+        body = _basic_manifest()
+        body["tools"] = {"default_enabled": "not a list"}
+        _write_manifest(catalog_dir, "demo", body)
+        from hermes_cli.mcp_catalog import list_catalog
+
+        # Invalid manifests are silently skipped at list_catalog level
+        assert list_catalog() == []
 
 
 class TestShippedCatalog:
