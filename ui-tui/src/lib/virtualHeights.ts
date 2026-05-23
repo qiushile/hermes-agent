@@ -72,11 +72,15 @@ export const estimatedMsgHeight = (
   {
     compact,
     details,
+    thinkingVisible = details,
+    toolsVisible = details,
     userPrompt = '',
     withSeparator = false
   }: {
     compact: boolean
     details: boolean
+    thinkingVisible?: boolean
+    toolsVisible?: boolean
     userPrompt?: string
     withSeparator?: boolean
   }
@@ -111,10 +115,12 @@ export const estimatedMsgHeight = (
   }
 
   if (details) {
-    const hasVisibleDetails = Boolean(msg.tools?.length || /\S/.test(msg.thinking ?? ''))
+    const hasVisibleTools = toolsVisible && Boolean(msg.tools?.length)
+    const hasVisibleThinking = thinkingVisible && /\S/.test(msg.thinking ?? '')
+    const hasVisibleDetails = hasVisibleTools || hasVisibleThinking
 
     if (hasVisibleDetails) {
-      h += (msg.tools?.length ?? 0) + wrappedLines(msg.thinking ?? '', bodyWidth)
+      h += (hasVisibleTools ? (msg.tools?.length ?? 0) : 0) + (hasVisibleThinking ? wrappedLines(msg.thinking ?? '', bodyWidth) : 0)
 
       if (msg.role === 'assistant' && /\S/.test(msg.text)) {
         h += 2

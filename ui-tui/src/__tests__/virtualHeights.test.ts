@@ -48,6 +48,29 @@ describe('virtual height estimates', () => {
     )
   })
 
+  it('honors per-section visibility when estimating response separators', () => {
+    const thinkingOnly: Msg = { role: 'assistant', text: 'ok', thinking: 'plan' }
+    const toolsOnly: Msg = { role: 'assistant', text: 'ok', tools: ['Tool A'] }
+
+    expect(
+      estimatedMsgHeight(thinkingOnly, 80, {
+        compact: false,
+        details: true,
+        thinkingVisible: false,
+        toolsVisible: true
+      })
+    ).toBe(estimatedMsgHeight(thinkingOnly, 80, { compact: false, details: false }))
+
+    expect(
+      estimatedMsgHeight(toolsOnly, 80, {
+        compact: false,
+        details: true,
+        thinkingVisible: true,
+        toolsVisible: false
+      })
+    ).toBe(estimatedMsgHeight(toolsOnly, 80, { compact: false, details: false }))
+  })
+
   it('reserves two extra rows for the inter-turn separator on non-first user messages', () => {
     const msg: Msg = { role: 'user', text: 'follow-up question' }
     const base = estimatedMsgHeight(msg, 80, { compact: false, details: false })
