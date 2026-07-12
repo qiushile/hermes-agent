@@ -68,6 +68,7 @@ import {
   IconLogin as LogIn,
   IconMail as Mail,
   IconMaximize as Maximize,
+  IconCircleLetterA as CircleLetterA,
   IconMessageCircle as MessageCircle,
   IconMessageQuestion as MessageQuestion,
   IconMessage2 as MessageSquareText,
